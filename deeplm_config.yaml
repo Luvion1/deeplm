@@ -1,0 +1,228 @@
+model_name: "Deeplm"
+version: "1.0.0"
+total_params: 108_500_000
+non_embedding_params: 70_100_000
+embedding_params: 38_400_000
+max_seq_length: 2048
+vocab_size: 128000
+dtype: "float32"
+
+tokenizer:
+  type: "BBPE"
+  vocab_size: 128000
+  pad_token: "<|pad|>"
+  bos_token: "<|begin_of_sentence|>"
+  eos_token: "<|end_of_sentence|>"
+  unk_token: "<|unk|>"
+  mask_token: "<|mask|>"
+  special_tokens:
+    system: "<|system|>"
+    user: "<|user|>"
+    assistant: "<|assistant|>"
+    tool_call: "<|tool_call|>"
+    tool_response: "<|tool_response|>"
+    think_start: "<|think_start|>"
+    think_end: "<|think_end|>"
+    self_evolve: "<|self_evolve|>"
+    memory_write: "<|memory_write|>"
+    memory_read: "<|memory_read|>"
+
+architecture:
+  type: "decoder_only"
+  num_layers: 8
+  hidden_size: 384
+  intermediate_size: 1536
+  num_attention_heads: 8
+  num_key_value_heads: 1
+  head_dim: 96
+  rope_head_dim: 32
+  nope_head_dim: 64
+  max_seq_length: 2048
+  rope_theta: 10000.0
+
+mla:
+  enabled: true
+  q_lora_rank: 192
+  kv_lora_rank: 128
+  qk_rope_head_dim: 32
+  qk_nope_head_dim: 64
+  v_head_dim: 96
+  num_heads: 8
+  kv_heads: 1
+  o_groups: 4
+  use_absorption_trick: true
+  decoupled_rope: true
+
+moe:
+  enabled: true
+  num_routed_experts: 4
+  num_shared_experts: 1
+  top_k: 2
+  expert_intermediate_size: 768
+  expert_activation: "swiglu"
+  shared_expert_intermediate_size: 768
+  router:
+    scoring_function: "sqrtsoftplus"
+    noaux_tc: true
+    bias_update_speed: 0.001
+    load_balance_tolerance: 0.1
+    max_expert_capacity: 1.5
+  expert_affinity:
+    enabled: true
+    memory_size: 1024
+    decay_factor: 0.95
+
+hyper_connections:
+  enabled: true
+  hc_mult: 4
+  sinkhorn_iterations: 2
+  sinkhorn_temperature: 0.1
+  hc_dim: 384
+  connection_types:
+    - "skip"
+    - "identity"
+    - "transform"
+    - "gate"
+  initial_weights:
+    identity: 0.6
+    skip: 0.0
+    transform: 0.2
+    gate: 0.2
+
+mtp:
+  enabled: true
+  num_mtp_layers: 1
+  mtp_depth: 2
+  mtp_hidden_size: 384
+  mtp_loss_weight: 0.3
+  mtp_positional_encoding: "rope"
+  mtp_head: "tied"
+
+hybrid_attention:
+  enabled: true
+  softmax_layers: [0, 4, 7]
+  linear_layers: [1, 2, 3, 5, 6]
+  linear_attention_config:
+    type: "lightning_attention_v2"
+    block_size: 256
+    intra_block_type: "left_product"
+    inter_block_type: "right_product"
+    activation: "swish"
+    use_tiling: true
+
+self_evolution:
+  enabled: true
+  autonomous_research:
+    enabled: true
+    max_iterations: 100
+    workflow:
+      - "hypothesis_generation"
+      - "experiment_design"
+      - "code_execution"
+      - "log_analysis"
+      - "bug_diagnosis"
+      - "code_fix"
+      - "evaluation"
+      - "decision"
+    auto_commit: true
+    coverage_target: 0.35
+  harness_optimization:
+    enabled: true
+    target_components:
+      - "scaffold"
+      - "sampling_params"
+      - "workflow_strategy"
+    improvement_threshold: 0.30
+  meta_memory:
+    enabled: true
+    memory_type: "short_term"
+    memory_file: "deeplm_memory.jsonl"
+    max_memory_entries: 10000
+    feedback_chain:
+      enabled: true
+      chain_length: 5
+    consolidation_schedule: 100
+
+agent_harness:
+  enabled: true
+  framework: "OpenClaw"
+  build_autonomously: true
+  auto_buildable:
+    - "skills"
+    - "memory"
+    - "guardrails"
+    - "evaluation"
+    - "mcp_servers"
+  dev_harness_config:
+    auto_generate: true
+    human_code_required: false
+  tool_calling:
+    enabled: true
+    protocols:
+      - "HTTP"
+      - "RESTful"
+      - "gRPC"
+      - "MCP"
+    max_tools_per_call: 10
+    tool_call_accuracy_target: 0.987
+
+training:
+  pretraining:
+    dataset: "FineWeb-Edu"
+    max_tokens: 5_000_000_000
+    batch_size: 8
+    gradient_accumulation_steps: 4
+    learning_rate: 6.0e-4
+    min_learning_rate: 6.0e-6
+    lr_schedule: "cosine"
+    warmup_steps: 150
+    weight_decay: 0.1
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_epsilon: 1.0e-8
+    max_grad_norm: 1.0
+    use_gradient_checkpointing: true
+    use_flash_attention: true
+  sft:
+    dataset: "SmolTalk"
+    epochs: 3
+    steps: 3000
+    batch_size: 4
+    gradient_accumulation_steps: 2
+    learning_rate: 1.0e-4
+    lr_schedule: "cosine"
+    warmup_steps: 100
+
+inference:
+  generation:
+    temperature: 0.7
+    top_k: 50
+    top_p: 0.9
+    repetition_penalty: 1.05
+    max_new_tokens: 1024
+    do_sample: true
+  thinking_mode:
+    enabled: true
+    think_token_start: "<|think_start|>"
+    think_token_end: "<|think_end|>"
+    max_think_tokens: 512
+    think_temperature: 0.6
+
+hardware:
+  training:
+    gpu: "A100_80GB"
+    num_gpus: 1
+    memory_required_gb: 40
+    disk_space_gb: 100
+  inference:
+    gpu: "A10_24GB"
+    num_gpus: 1
+    memory_required_gb: 8
+
+output_heads:
+  lm_head:
+    type: "tied"
+    bias: false
+  mtp_heads:
+    num_heads: 1
+    type: "tied"
