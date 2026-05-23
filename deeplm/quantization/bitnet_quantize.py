@@ -118,9 +118,9 @@ def apply_bitnet_quantization(model: nn.Module, scale: str = "absmean", verbose:
                 continue
 
             try:
-                # Quantize weights in-place for inference
+                # Quantize weights in-place (copy to avoid set_ on graph input)
                 q_weight, gamma = ternary_quantize(module.weight, scale)
-                module.weight.data = q_weight * gamma
+                module.weight.detach().copy_(q_weight * gamma)
                 stats["quantized"] += 1
 
                 if verbose:

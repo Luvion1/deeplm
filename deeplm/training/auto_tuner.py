@@ -49,6 +49,11 @@ class AutoTuner:
     EVALLOSS_MAXLEN = 50
     LAYERGN_MAXLEN = 20
     PLANHIST_MAXLEN = 50
+    AUTO_LAG_MAXLEN = 6
+    AUTO_CORR_SAMPLE = 1_000_000
+    HESS_EVAL_EVERY = 50
+    KURT_ALPHA = 0.05
+    AUTO_LAGS = (1, 3, 5)
 
     def __init__(self, lr, warmup, total, gn=1.0):
         self.base_lr = lr
@@ -273,8 +278,57 @@ class AutoTuner:
         self._dataset_weights = {}
         self._last_dataset_suggest = 0
 
+        # ── v10: Mathematical Precision Signals ──
+
+        # Gradient autocorrelation at multiple lags
+        self._grad_flat_cache = deque(maxlen=max(self.AUTO_LAGS) + 1)  # flat grad vecs
+        self._grad_autocorr = {lag: 0.0 for lag in self.AUTO_LAGS}
+        self._grad_autocorr_init = {lag: False for lag in self.AUTO_LAGS}
+
+        # Gradient higher moments (skewness, kurtosis)
+        self._grad_skew_ema = 0.0
+        self._grad_kurt_ema = 0.0
+        self._grad_moments_init = False
+
+        # Loss autocorrelation (ρ₁, ρ₂)
+        self._loss_prev = None
+        self._loss_lag1_corr = 0.0
+        self._loss_lag2_corr = 0.0
+        self._loss_corr_init = False
+
+        # Hutchinson Hessian trace estimation
+        self._hessian_trace_ema = 0.0
+        self._hessian_trace_init = False
+        self._hessian_step = 0
+        self._hessian_noise_ratio = 0.0  # trace / grad_norm²
+
+        # Lipschitz LR bound
+        self._lip_gn_prev = None
+        self._lip_bound = float("inf")
+        self._lip_init = False
+        self._lip_alpha = 0.1
+
+        # Effective gradient rank (via spectral ratio)
+        self._grad_spectral_ratio = 1.0  # λ₁ / Σλᵢ
+        self._spectral_init = False
+
+        # Kalman filter for loss
+        self._kalman_x = 0.0    # estimated state
+        self._kalman_P = 1.0    # estimate covariance
+        self._kalman_Q = 1e-4   # process noise
+        self._kalman_R = 1e-2   # measurement noise
+        self._kalman_init = False
+        self._kalman_gain = 0.0
+        self._kalman_innov = 0.0
+
+        # Loss change-point detection (CUSUM)
+        self._cusum_S = 0.0
+        self._cusum_thr = 3.0
+        self._cusum_mean = 0.0
+        self._cusum_n = 0
+
     # ── Gradient capture (call before optimizer.step) ──
-    def capture_gradients(self, model):
+    def capture_gradients(self, model, step=None):
         flat = []
         comp_stats = {}
         layer_norms = {}
@@ -334,6 +388,11 @@ class AutoTuner:
                 else:
                     self.grad_hist_ema[comp] = fresh
         self.grad_hist = self.grad_hist_ema
+        for _fn in (self._update_gradient_autocorr, self._update_gradient_moments, self._update_spectral_ratio):
+            try:
+                _fn(model)
+            except Exception:
+                pass
 
     # ── Update capture (call after optimizer.step, before zero_grad) ──
     def capture_update(self, model):
@@ -438,6 +497,13 @@ class AutoTuner:
             pd = self._pending_dynamics
             self._update_dynamics(pd["loss_before"], self.ema_short, pd["d_lr"], pd["d_wd"])
             self._pending_dynamics = {}
+
+        # ── v10: Mathematical precision updates ──
+        for _fn in (self._update_loss_autocorr, self._kalman_filter_step, self._update_cusum, self._estimate_lipschitz_bound):
+            try:
+                _fn(loss)
+            except Exception:
+                pass
 
     def _update_phase(self, step):
         if step < self.warmup:
@@ -771,6 +837,69 @@ class AutoTuner:
             elif self.traj_fit["slope"] > -0.1:
                 reasons.append("trajectory predicts slow convergence")
                 needs.append("may need LR boost to reach target")
+        # ── v10: Mathematical diagnosis enhancements ──
+        if self._grad_moments_init:
+            if self._grad_kurt_ema > 3.0:
+                reasons.append(f"heavy-tailed gradients (kurtosis={self._grad_kurt_ema:.1f})")
+                if diagnosis in ("learning_well", "learning_slow", "stable"):
+                    needs.append("reduce LR slightly for gradient stability")
+            elif self._grad_kurt_ema < -1.0:
+                reasons.append(f"abnormally light-tailed gradients")
+                needs.append("check for gradient shrinkage")
+            if abs(self._grad_skew_ema) > 2.0:
+                reasons.append(f"skewed gradient distribution ({self._grad_skew_ema:.1f})")
+                needs.append("consider gradient whitening")
+        if self._grad_autocorr_init[1]:
+            if all(self._grad_autocorr.get(lag, 0) < 0.1 for lag in self.AUTO_LAGS):
+                reasons.append("gradient directions decorrelated (high noise)")
+                if diagnosis in ("stable",):
+                    needs.append("reduce LR to combat gradient noise")
+            elif self._grad_autocorr.get(1, 0) > 0.8 and self._grad_autocorr.get(5, 0) > 0.5:
+                reasons.append("gradient directions highly persistent")
+                if self.lr_mult < 1.0:
+                    needs.append("can safely increase LR")
+            lag1 = self._grad_autocorr.get(1, 0)
+            lag3 = self._grad_autocorr.get(3, 0)
+            if lag1 > 0.3 and lag3 < -0.1:
+                reasons.append("alternating gradient directions (periodic)")
+                if diagnosis != "oscillating":
+                    needs.append("add momentum damping")
+        if self._loss_corr_init:
+            if self._loss_lag1_corr < 0:
+                reasons.append("negative loss autocorrelation (oscillation)")
+                if diagnosis not in ("oscillating", "diverging"):
+                    needs.append("reduce LR to dampen oscillation")
+        if self._hessian_trace_init and self.gn_var_init:
+            nr = self._hessian_noise_ratio
+            if nr > 10.0:
+                reasons.append(f"high Hessian noise ratio ({nr:.1f})")
+                needs.append("reduce LR (curvature >> gradient scale)")
+            elif nr < 0.1:
+                reasons.append("low Hessian curvature")
+                if diagnosis in ("plateauing", "stuck"):
+                    needs.append("LR spike less effective (low curvature)")
+        if self._lip_init and self._lip_bound < float("inf"):
+            max_safe_lr = self._lip_bound
+            current_lr = self.base_lr * self.lr_mult
+            if current_lr > max_safe_lr * 0.5:
+                reasons.append(f"LR near Lipschitz bound ({current_lr:.2e} / {max_safe_lr:.2e})")
+                if diagnosis in ("oscillating", "diverging"):
+                    needs.append("reduce LR below Lipschitz threshold")
+        if self._spectral_init:
+            if self._grad_spectral_ratio > 0.5:
+                reasons.append(f"gradients low-rank (spectral ratio={self._grad_spectral_ratio:.2f})")
+                if diagnosis in ("plateauing", "stuck"):
+                    needs.append("increase stochasticity (higher LR or batch noise)")
+        if self._cusum_n > 20 and self._cusum_S > self._cusum_thr:
+            reasons.append(f"CUSUM change detected (S={self._cusum_S:.1f})")
+            if diagnosis not in ("diverging", "oscillating"):
+                needs.append("consider LR regime change")
+        if self._kalman_init and self.short_init:
+            kalman_gap = self._kalman_x - self.ema_short
+            if abs(kalman_gap) > 0.1 * self.ema_short:
+                reasons.append(f"Kalman-EMA divergence ({kalman_gap:.3f})")
+                if diagnosis in ("stable",):
+                    needs.append("verify loss signal quality")
         self.diagnosis = diagnosis
         self.diagnosis_reasons = reasons
         self.model_needs = needs
@@ -1119,6 +1248,19 @@ class AutoTuner:
             "orig_wd": self.wd_mult,
             "cv_gn": math.sqrt(self.gn_var) / max(self.gn_ema, 1e-12) if self.gn_var > 0 and self.gn_ema > 0 else None,
             "traj_diverging": self.traj_fit and self.traj_fit["r2"] > 0.7 and self.traj_fit["slope"] > 0,
+            # ── v10: Mathematical signals ──
+            "high_kurt": self._grad_moments_init and self._grad_kurt_ema > 2.0,
+            "low_kurt": self._grad_moments_init and self._grad_kurt_ema < -0.5,
+            "grad_ac_low": self._grad_autocorr_init[1] and all(
+                self._grad_autocorr.get(lag, 0) < 0.1 for lag in self.AUTO_LAGS),
+            "grad_ac_high": self._grad_autocorr_init[1] and self._grad_autocorr.get(1, 0) > 0.7,
+            "grad_ac_neg": self._grad_autocorr_init[1] and self._grad_autocorr.get(1, 0) < -0.1,
+            "loss_ac_neg": self._loss_corr_init and self._loss_lag1_corr < 0,
+            "hess_high": self._hessian_trace_init and self._hessian_noise_ratio > 5.0,
+            "lip_risky": self._lip_init and (self.base_lr * self.lr_mult) > self._lip_bound * 0.5,
+            "low_rank": self._spectral_init and self._grad_spectral_ratio > 0.5,
+            "cusum_change": self._cusum_n > 20 and self._cusum_S > self._cusum_thr,
+            "low_noise": self.gn_noise_init and self.gn_noise_ema < 0.5,
         }
 
     def _handle_state_transition(self, step, adj, sig):
@@ -1283,6 +1425,242 @@ class AutoTuner:
                         adj["action"] = f"ROLLBACK: LR×{self.lr_mult:.2f}"
                         self.log.append({"step": step, "type": "rollback"})
 
+    def _handle_mathematical_signals(self, step, adj, sig):
+        if adj or not sig["cd"]:
+            return
+        if sig["grad_ac_neg"]:
+            nm = max(self.eff_floor, self.lr_mult * 0.85)
+            self._apply_lr(adj, step, nm)
+            adj["mom"] = 0.05
+            adj["action"] = f"MATH_AC_NEG: LR×{nm:.2f} mom+0.05"
+            self.log.append({"step": step, "type": "math_ac_neg"})
+            return
+        if sig["lip_risky"] and sig["high_kurt"]:
+            nm = max(self.eff_floor, self.lr_mult * 0.8)
+            self._apply_lr(adj, step, nm)
+            adj["action"] = f"MATH_LIP_KURT: LR×{nm:.2f}"
+            self.log.append({"step": step, "type": "math_lip_kurt"})
+            return
+        if sig["hess_high"] and self.state in ("oscillating", "diverging"):
+            nm = max(self.eff_floor, self.lr_mult * 0.6)
+            self._apply_lr(adj, step, nm)
+            self._apply_gn(adj, step, max(0.3, self.gn_mult * 0.7))
+            adj["action"] = f"MATH_HESS: LR×{nm:.2f} clip×{adj.get('gn_mult',0):.2f}"
+            self.log.append({"step": step, "type": "math_hess"})
+            return
+        if sig["grad_ac_low"] and sig["high_noise"] and not sig["low_kurt"]:
+            nm = max(self.eff_floor, self.lr_mult * 0.9)
+            self._apply_lr(adj, step, nm)
+            adj["action"] = f"MATH_NOISE: LR×{nm:.2f}"
+            self.log.append({"step": step, "type": "math_noise"})
+            return
+        if sig["grad_ac_high"] and sig["low_noise"] and self.lr_mult < 1.0:
+            nm = min(1.0, max(self.eff_floor, self.lr_mult * 1.1))
+            self._apply_lr(adj, step, nm)
+            adj["action"] = f"MATH_CONSISTENT: LR×{nm:.2f}"
+            self.log.append({"step": step, "type": "math_consistent"})
+            return
+        if sig["cusum_change"] and self.state == "improving":
+            nm = min(self.eff_ceil, self.lr_mult * 1.15)
+            self._apply_lr(adj, step, nm)
+            adj["action"] = f"MATH_CUSUM: LR×{nm:.2f}"
+            self.log.append({"step": step, "type": "math_cusum"})
+            return
+
+    # ═══════════════════════════════════════════════════════════════
+    # v10: Mathematical Precision Signals
+    # ═══════════════════════════════════════════════════════════════
+
+    def _update_gradient_autocorr(self, model):
+        grads = [p.grad.detach().view(-1) for p in model.parameters() if p.grad is not None]
+        if not grads:
+            return
+        flat = torch.cat(grads)
+        n = flat.numel()
+        if n > self.AUTO_CORR_SAMPLE:
+            idx = torch.randperm(n, device=flat.device)[:self.AUTO_CORR_SAMPLE]
+            flat = flat[idx]
+        cn = flat / (flat.norm() + 1e-12)
+        self._grad_flat_cache.append(cn)
+        c = self._grad_flat_cache
+        if len(c) <= max(self.AUTO_LAGS):
+            return
+        for lag in self.AUTO_LAGS:
+            if len(c) > lag:
+                prev = c[-(1 + lag)]
+                if prev.numel() != cn.numel():
+                    continue
+                r = (cn @ prev).item()
+                r = max(-1.0, min(1.0, r))
+                if not self._grad_autocorr_init[lag]:
+                    self._grad_autocorr[lag] = r
+                    self._grad_autocorr_init[lag] = True
+                else:
+                    self._grad_autocorr[lag] = 0.05 * r + 0.95 * self._grad_autocorr[lag]
+
+    def _update_gradient_moments(self, model):
+        grads = [p.grad.detach().view(-1) for p in model.parameters() if p.grad is not None]
+        if not grads:
+            return
+        all_g = torch.cat(grads)
+        n = all_g.numel()
+        if n < 10:
+            return
+        if n > self.AUTO_CORR_SAMPLE:
+            idx = torch.randperm(n, device=all_g.device)[:self.AUTO_CORR_SAMPLE]
+            all_g = all_g[idx]
+        m1 = all_g.mean()
+        m2 = ((all_g - m1) ** 2).mean()
+        m3 = ((all_g - m1) ** 3).mean()
+        m4 = ((all_g - m1) ** 4).mean()
+        s2 = m2 + 1e-12
+        skew = m3 / (s2 ** 1.5)
+        kurt = m4 / (s2 ** 2) - 3.0
+        skew = max(-10.0, min(10.0, skew.item()))
+        kurt = max(-10.0, min(10.0, kurt.item()))
+        if not self._grad_moments_init:
+            self._grad_skew_ema = skew
+            self._grad_kurt_ema = kurt
+            self._grad_moments_init = True
+        else:
+            a = self.KURT_ALPHA
+            self._grad_skew_ema = a * skew + (1 - a) * self._grad_skew_ema
+            self._grad_kurt_ema = a * kurt + (1 - a) * self._grad_kurt_ema
+
+    def _update_loss_autocorr(self, loss):
+        if self._loss_prev is not None:
+            if not self._loss_corr_init:
+                self._loss_lag1_corr = loss * self._loss_prev
+                self._loss_lag2_corr = self._loss_prev * self._loss_prev
+                self._loss_corr_init = True
+            else:
+                d = 0.05
+                self._loss_lag1_corr = (1 - d) * self._loss_lag1_corr + d * loss * self._loss_prev
+        if self._loss_prev is not None:
+            self._loss_lag2 = self._loss_prev
+        self._loss_prev = loss
+
+    def _estimate_hessian_trace(self, model, step):
+        if step - self._hessian_step < self.HESS_EVAL_EVERY:
+            return
+        self._hessian_step = step
+        model.eval()
+        v = {n: torch.randint(0, 2, p.shape, device=p.device).float() * 2 - 1
+             for n, p in model.named_parameters() if p.grad is not None}
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if n in v:
+                    p._hess_v = p.grad.clone() if p.grad is not None else None
+        outs = []
+        for n, p in model.named_parameters():
+            if n in v and p._hess_v is not None:
+                out = (v[n] * p._hess_v).sum()
+                outs.append(out)
+        hv_norm = sum(outs).item() if outs else 0.0
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if hasattr(p, '_hess_v'):
+                    del p._hess_v
+        trace = (v_dot := hv_norm)
+        gnorm2 = sum((p.grad.detach() ** 2).sum().item() for p in model.parameters() if p.grad is not None)
+        if not self._hessian_trace_init:
+            self._hessian_trace_ema = trace
+            self._hessian_trace_init = True
+        else:
+            self._hessian_trace_ema = 0.05 * trace + 0.95 * self._hessian_trace_ema
+        self._hessian_noise_ratio = trace / (math.sqrt(gnorm2) + 1e-12) if gnorm2 > 0 else 0.0
+        model.train()
+
+    def _estimate_lipschitz_bound(self):
+        gn = self.gn_ema if self.gn_var_init else None
+        if gn is None:
+            return
+        if self._lip_gn_prev is not None and self._lip_init:
+            delta_gn = abs(gn - self._lip_gn_prev)
+            if delta_gn > 1e-12 and gn > 0:
+                local_L = delta_gn / (self.base_lr * self.lr_mult + 1e-12)
+                bound_i = 2.0 / (local_L + 1e-12)
+                if not self._lip_init:
+                    self._lip_bound = bound_i
+                    self._lip_init = True
+                else:
+                    self._lip_bound = (1 - self._lip_alpha) * self._lip_bound + self._lip_alpha * bound_i
+        self._lip_gn_prev = gn
+        self._lip_init = True
+
+    def _kalman_filter_step(self, loss):
+        if math.isnan(loss) or math.isinf(loss):
+            return
+        if not self._kalman_init:
+            self._kalman_x = loss
+            self._kalman_P = 1.0
+            self._kalman_init = True
+            return
+        self._kalman_P = self._kalman_P + self._kalman_Q
+        K = self._kalman_P / (self._kalman_P + self._kalman_R)
+        innov = loss - self._kalman_x
+        self._kalman_x = self._kalman_x + K * innov
+        self._kalman_P = (1 - K) * self._kalman_P
+        self._kalman_gain = K
+        self._kalman_innov = innov
+
+    def _update_spectral_ratio(self, model):
+        grads = [p.grad.detach().view(-1) for p in model.parameters() if p.grad is not None]
+        if not grads:
+            return
+        g = torch.cat(grads)
+        n = g.numel()
+        if n < 20:
+            return
+        if n > self.AUTO_CORR_SAMPLE:
+            idx = torch.randperm(n, device=g.device)[:self.AUTO_CORR_SAMPLE]
+            g = g[idx]
+        n = g.numel()
+        g_c = g - g.mean()
+        g_c = g_c / (g_c.norm() + 1e-12)
+        d = max(2, min(100, n // 10))
+        idx = torch.randperm(n, device=g.device)[:d]
+        sub = g_c[idx]
+        cov_approx = sub.unsqueeze(1) @ sub.unsqueeze(0)
+        try:
+            s = torch.linalg.eigvalsh(cov_approx)
+        except RuntimeError:
+            return
+        l1 = s[-1].item()
+        tr = s.sum().item()
+        ratio = l1 / (tr + 1e-12) if tr > 0 else 1.0
+        if not self._spectral_init:
+            self._grad_spectral_ratio = ratio
+            self._spectral_init = True
+        else:
+            self._grad_spectral_ratio = 0.05 * ratio + 0.95 * self._grad_spectral_ratio
+
+    def _update_cusum(self, loss):
+        if math.isnan(loss) or math.isinf(loss):
+            return
+        a = 0.01
+        if self._cusum_n == 0:
+            self._cusum_mean = loss
+            self._cusum_n = 1
+            return
+        self._cusum_mean = (1 - a) * self._cusum_mean + a * loss
+        resid = loss - self._cusum_mean
+        self._cusum_S = max(0, self._cusum_S + resid)
+        self._cusum_n += 1
+
+    def _compute_mathematical_stats(self, model, step, loss):
+        if step % 5 == 0:
+            self._update_gradient_autocorr(model)
+            self._update_gradient_moments(model)
+        if step % 10 == 0:
+            self._update_spectral_ratio(model)
+        self._update_loss_autocorr(loss)
+        self._kalman_filter_step(loss)
+        self._update_cusum(loss)
+        self._estimate_lipschitz_bound()
+        if step % self.HESS_EVAL_EVERY == 0:
+            self._estimate_hessian_trace(model, step)
+
     # ═══════════════════════════════════════════════════════════════
     # REFACTORED: Smart adjustments
     # ═══════════════════════════════════════════════════════════════
@@ -1323,6 +1701,7 @@ class AutoTuner:
         self._handle_sick_layers(step, adj, signals)
         self._handle_grad_clipping(step, adj, signals)
         self._handle_traj_divergence(step, adj, signals)
+        self._handle_mathematical_signals(step, adj, signals)
         self._handle_rollback(step, adj, signals)
 
         # ── Oscillation dampener ──
@@ -1475,6 +1854,24 @@ class AutoTuner:
         s["plan_strategy"] = self.plan.get("strategy", "none")
         s["plan_accuracy"] = f"{self.plan_accuracy:.2f}"
         s["traj_score"] = f"{self._traj_score:.2f}"
+        if self._grad_moments_init:
+            s["grad_skew"] = f"{self._grad_skew_ema:.3f}"
+            s["grad_kurt"] = f"{self._grad_kurt_ema:.3f}"
+        if self._hessian_trace_init:
+            s["hess_tr"] = f"{self._hessian_trace_ema:.2e}"
+            s["hess_nr"] = f"{self._hessian_noise_ratio:.3f}"
+        if self._lip_init:
+            s["lip_bound"] = f"{self._lip_bound:.2e}"
+        if self._grad_autocorr_init[1]:
+            ac_str = " ".join(f"ρ{τ}={self._grad_autocorr.get(τ,0):.2f}" for τ in self.AUTO_LAGS)
+            s["grad_ac"] = ac_str
+        if self._loss_corr_init:
+            s["loss_ac1"] = f"{self._loss_lag1_corr:.4f}"
+        if self._kalman_init:
+            s["kalman"] = f"{self._kalman_x:.4f}"
+            s["kalman_g"] = f"{self._kalman_gain:.3f}"
+        if self._spectral_init:
+            s["spec_ratio"] = f"{self._grad_spectral_ratio:.3f}"
         if self.traj_fit:
             s["traj_slope"] = f"{self.traj_fit['slope']:.4f}"
             s["traj_r2"] = f"{self.traj_fit['r2']:.3f}"
@@ -1554,6 +1951,23 @@ class AutoTuner:
             "traj_last_fit": self.traj_last_fit,
             "goals": self.goals,
             "_traj_score": self._traj_score,
+            # v10: Mathematical signals
+            "_grad_skew_ema": self._grad_skew_ema,
+            "_grad_kurt_ema": self._grad_kurt_ema,
+            "_grad_moments_init": self._grad_moments_init,
+            "_loss_lag1_corr": self._loss_lag1_corr,
+            "_loss_lag2_corr": self._loss_lag2_corr,
+            "_loss_corr_init": self._loss_corr_init,
+            "_hessian_trace_ema": self._hessian_trace_ema,
+            "_hessian_trace_init": self._hessian_trace_init,
+            "_hessian_noise_ratio": self._hessian_noise_ratio,
+            "_lip_bound": self._lip_bound,
+            "_lip_init": self._lip_init,
+            "_grad_spectral_ratio": self._grad_spectral_ratio,
+            "_spectral_init": self._spectral_init,
+            "_kalman_x": self._kalman_x,
+            "_kalman_P": self._kalman_P,
+            "_kalman_init": self._kalman_init,
         }
         sd["dynamics_global"] = dict(self.dynamics["global"])
         sd["dynamics_per_phase"] = {k: dict(v) for k, v in self.dynamics["per_phase"].items()}
@@ -1626,7 +2040,10 @@ class AutoTuner:
             self.gn_hist = deque(saved_gn, maxlen=self.GNHIST_MAXLEN)
         if "grad_hist_ema" in state:
             self.grad_hist_ema = state["grad_hist_ema"]
-            self.grad_hist = self.grad_hist_ema
+        self.grad_hist = self.grad_hist_ema
+        self._update_gradient_autocorr(model)
+        self._update_gradient_moments(model)
+        self._update_spectral_ratio(model)
         if "adj_memory" in state:
             self.adj_memory = deque(state["adj_memory"], maxlen=self.ADJMEM_MAXLEN)
         if "last_adj_loss" in state:
@@ -1700,6 +2117,24 @@ class AutoTuner:
         saved_pending = state.get("_pending_dynamics")
         if saved_pending:
             self._pending_dynamics = dict(saved_pending)
+
+        # v10: Restore mathematical signals
+        self._grad_skew_ema = state.get("_grad_skew_ema", 0.0)
+        self._grad_kurt_ema = state.get("_grad_kurt_ema", 0.0)
+        self._grad_moments_init = state.get("_grad_moments_init", False)
+        self._loss_lag1_corr = state.get("_loss_lag1_corr", 0.0)
+        self._loss_lag2_corr = state.get("_loss_lag2_corr", 0.0)
+        self._loss_corr_init = state.get("_loss_corr_init", False)
+        self._hessian_trace_ema = state.get("_hessian_trace_ema", 0.0)
+        self._hessian_trace_init = state.get("_hessian_trace_init", False)
+        self._hessian_noise_ratio = state.get("_hessian_noise_ratio", 0.0)
+        self._lip_bound = state.get("_lip_bound", float("inf"))
+        self._lip_init = state.get("_lip_init", False)
+        self._grad_spectral_ratio = state.get("_grad_spectral_ratio", 1.0)
+        self._spectral_init = state.get("_spectral_init", False)
+        self._kalman_x = state.get("_kalman_x", 0.0)
+        self._kalman_P = state.get("_kalman_P", 1.0)
+        self._kalman_init = state.get("_kalman_init", False)
 
     # ── v9: New Algorithms ──
 
