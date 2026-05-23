@@ -111,11 +111,7 @@ def apply_bitnet_quantization(model: nn.Module, scale: str = "absmean", verbose:
         if isinstance(module, nn.Linear):
             stats["total_linear"] += 1
 
-            # Skip embedding-like layers and small layers
-            if module.weight.shape[0] < 64 or module.weight.shape[1] < 64:
-                if verbose:
-                    print(f"  Skipping {name} (too small: {module.weight.shape})")
-                continue
+
 
             try:
                 # Quantize weights in-place (copy to avoid set_ on graph input)
